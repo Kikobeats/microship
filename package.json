@@ -1,0 +1,39 @@
+{
+  "name": "microship",
+  "description": "Readiness, liveness, and graceful shutdown for a Node process on Kubernetes.",
+  "homepage": "https://github.com/Kikobeats/microship",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "author": {
+    "email": "josefrancisco.verdu@gmail.com",
+    "name": "Kiko Beats",
+    "url": "https://github.com/Kikobeats"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kikobeats/microship.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Kikobeats/microship/issues"
+  },
+  "keywords": [
+    "kubernetes",
+    "liveness",
+    "readiness",
+    "shutdown"
+  ],
+  "devDependencies": {
+    "standard": "latest"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "lint": "standard",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
