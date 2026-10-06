@@ -48,14 +48,14 @@ It creates an HTTP service used to check [container probes](https://kubernetes.i
 
 Both endpoints answer with a status code and an empty body. Any other path returns `404`.
 
-| Endpoint | `200`                                             | `500`                                                              |
-| -------- | ------------------------------------------------- | ------------------------------------------------------------------ |
-| `/ready` | After `signalReady()`.                            | Before `signalReady()`, after `signalNotReady()`, during shutdown. |
-| `/live`  | The event loop ran within the last `staleMs` (15s). | The event loop has been stalled for `staleMs`, or during shutdown. |
+| Endpoint | `200`                                       | `500`                                                           |
+| -------- | ------------------------------------------- | --------------------------------------------------------------- |
+| `/ready` | After `signalReady()`.                      | Before `signalReady()`, during shutdown.                        |
+| `/live`  | The event loop ran within the last 15 seconds. | The event loop has been stalled for 15 seconds, or during shutdown. |
 
 `/ready` is used to configure the readiness probe: it tells Kubernetes whether to send traffic to the pod. `/live` is used to configure the liveness probe: it tells Kubernetes whether to restart the container.
 
-The endpoints are separate so a container can take itself out of rotation with `signalNotReady()` without being restarted.
+The endpoints are separate because they answer different questions: a process that is booting or draining is not ready, and it should not be restarted for it.
 
 ### Why a worker thread
 
@@ -68,14 +68,14 @@ Warning  Unhealthy  3m28s (x15 over 4m38s)  kubelet  Readiness probe failed: Get
 
 Kubernetes marks a healthy pod as unready, and the remaining pods take more load.
 
-**microship** serves the probes from a worker thread. The main thread writes its state and a heartbeat every 500ms into a `SharedArrayBuffer`, and the worker reads it. A busy main thread keeps answering `/ready` with `200`. `/live` fails only when the heartbeat has not moved for `staleMs`, which is a stalled process and not a busy one.
+**microship** serves the probes from a worker thread. The main thread writes its state and a heartbeat every 500ms into a `SharedArrayBuffer`, and the worker reads it. A busy main thread keeps answering `/ready` with `200`. `/live` fails only when the heartbeat has not moved for 15 seconds, which is a stalled process and not a busy one.
 
 ## Graceful shutdown
 
-On `SIGTERM`, `SIGHUP`, or `SIGINT`, or when you call `ship.shutdown()`:
+On `SIGTERM` or `SIGINT`, or when you call `ship.shutdown()`:
 
 1. `/ready` and `/live` start returning `500`.
-2. It waits `shutdownDelay`, so Kubernetes stops routing new requests to the pod.
+2. It waits `shutdownDelay` (1 second by default), so Kubernetes stops routing new requests to the pod.
 3. It runs the shutdown handlers one at a time, in registration order.
 4. The process exits on its own once nothing keeps the event loop active. If it has not exited one second after the last handler finishes, `terminate` is called.
 
@@ -119,7 +119,7 @@ spec:
       labels:
         app: app
     spec:
-      # Must be above shutdownDelay + shutdownHandlerTimeout + 1s (11 seconds with the defaults).
+      # Must be above shutdownDelay + shutdownHandlerTimeout + 1s (7 seconds with the defaults).
       terminationGracePeriodSeconds: 30
       containers:
         - name: app
@@ -144,11 +144,10 @@ spec:
             httpGet:
               path: /ready
               port: probes
-            # Must match the `shutdownDelay` option (5000 milliseconds).
-            periodSeconds: 5
+            # Must match the `shutdownDelay` option (1000 milliseconds).
+            periodSeconds: 1
             failureThreshold: 1
             successThreshold: 1
-            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /live
@@ -168,18 +167,9 @@ Each value is tied to a **microship** option. When you change one side, change t
 | `readinessProbe.periodSeconds`                       | `shutdownDelay`                                        | Equal, so the pod is observed as not ready before the shutdown handlers run.                 |
 | `terminationGracePeriodSeconds`                      | `shutdownDelay + shutdownHandlerTimeout + 1s`          | Greater. Otherwise the kubelet sends `SIGKILL` before the handlers finish.                   |
 | `livenessProbe.periodSeconds * failureThreshold`     | `shutdownDelay + shutdownHandlerTimeout + 1s`          | Greater, because `/live` returns `500` from the moment the shutdown starts.                  |
-| `livenessProbe.periodSeconds * failureThreshold`     | `staleMs`                                              | A stalled event loop is restarted within the sum of both: 45 seconds with these values.      |
+| `livenessProbe.periodSeconds * failureThreshold`     | The 15 seconds of stalled event loop before `/live` fails | A stalled event loop is restarted within the sum of both: 45 seconds with these values.      |
 
-How quickly Kubernetes observes that the state has changed depends on the [probe configuration](https://kubernetes.io/docs/concepts/workloads/pods/probes/#configure-probes), specifically `periodSeconds`, `successThreshold` and `failureThreshold`. Expect requests to continue coming through for a while after calling `signalNotReady()`.
-
-## Local mode
-
-Kubernetes is detected through the `KUBERNETES_SERVICE_HOST` environment variable. If **microship** detects that it is running in a non-Kubernetes environment (e.g. your local machine):
-
-- It starts the HTTP service on any available port. This avoids port collisions when multiple services using **microship** are being developed on the same machine. The bound port is available as `ship.port`.
-- `shutdownDelay` defaults to `0`, i.e. it immediately proceeds to execute the shutdown handlers.
-
-Detection of the local mode can be overridden by setting `{ detectKubernetes: false }`.
+**microship** always binds `port`, inside and outside Kubernetes. Two processes on the same machine need different ports, or `port: 0` to take any available one. The bound port is available as `ship.port`.
 
 ## API
 
@@ -189,25 +179,18 @@ Returns a `Promise` that resolves to a `ship` once the probe server is listening
 
 #### options
 
-| Name                     | Type         | Default                           | Description                                                                 |
-| ------------------------ | ------------ | --------------------------------- | --------------------------------------------------------------------------- |
-| `port`                   | `number`     | `3001`                            | Probe server port. It must be different from your main service port. Outside Kubernetes a random free port is used instead. |
-| `shutdownDelay`          | `number`     | `5000`, or `0` outside Kubernetes | Milliseconds between failing the probes and running the shutdown handlers. It should match `readinessProbe.periodSeconds`. |
-| `shutdownHandlerTimeout` | `number`     | `5000`                            | Milliseconds the shutdown handlers get before `terminate` is forced.        |
-| `staleMs`                | `number`     | `15000`                           | Milliseconds without a heartbeat before `/live` fails.                      |
-| `signals`                | `string[]`   | `['SIGTERM', 'SIGHUP', 'SIGINT']` | Signals that start the shutdown.                                            |
-| `terminate`              | `function`   | `() => process.exit(0)`           | Called to end the process.                                                  |
-| `detectKubernetes`       | `boolean`    | `true`                            | When `false`, `port` and `shutdownDelay` behave as they do inside Kubernetes. |
+| Name                     | Type       | Default                 | Description                                                                                                              |
+| ------------------------ | ---------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `port`                   | `number`   | `3001`                  | Probe server port. It must be different from your main service port. `0` binds any available port.                       |
+| `shutdownDelay`          | `number`   | `1000`                  | Milliseconds between failing the probes and running the shutdown handlers. It should match `readinessProbe.periodSeconds`. |
+| `shutdownHandlerTimeout` | `number`   | `5000`                  | Milliseconds the shutdown handlers get before `terminate` is forced.                                                     |
+| `terminate`              | `function` | `() => process.exit(0)` | Called to end the process.                                                                                               |
 
 ### ship
 
 #### .signalReady()
 
 Makes `/ready` return `200`. It does nothing once the shutdown has started.
-
-#### .signalNotReady()
-
-Makes `/ready` return `500` without shutting down. Use it to take the pod out of rotation while a dependency is unavailable.
 
 #### .registerShutdownHandler(fn)
 
@@ -216,14 +199,6 @@ Adds a function to run during shutdown. It can return a `Promise`.
 #### .shutdown()
 
 Starts the shutdown sequence without waiting for a signal. Returns a `Promise` that resolves when the handlers have run. Calling it again does nothing.
-
-#### .isServerReady()
-
-Returns `true` after `signalReady()` and before the shutdown starts.
-
-#### .isServerShuttingDown()
-
-Returns `true` once the shutdown has started.
 
 #### .port
 
