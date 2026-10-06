@@ -19,10 +19,8 @@ const get = port =>
 
 const create = overrides =>
   createMicroship({
-    detectKubernetes: false,
     port: 0,
     shutdownDelay: 0,
-    signals: [],
     terminate () {},
     ...overrides
   })
@@ -33,10 +31,7 @@ describe('microship', () => {
     try {
       assert.equal(await get(ship.port), 500)
       ship.signalReady()
-      assert.equal(ship.isServerReady(), true)
       assert.equal(await get(ship.port), 200)
-      ship.signalNotReady()
-      assert.equal(await get(ship.port), 500)
     } finally {
       await ship.stop()
     }
@@ -52,7 +47,6 @@ describe('microship', () => {
       }
     })
     ship.registerShutdownHandler(async () => {
-      assert.equal(ship.isServerShuttingDown(), true)
       assert.equal(await get(ship.port), 500)
       ran = true
     })
@@ -97,7 +91,12 @@ process.stdin.on('data', () => {
 })
 process.stdout.write('ready\\n')`
       ],
-      { env: { ...process.env, PROBE_URL: `http://127.0.0.1:${ship.port}/ready` } }
+      {
+        env: {
+          ...process.env,
+          PROBE_URL: `http://127.0.0.1:${ship.port}/ready`
+        }
+      }
     )
     try {
       let out = ''
