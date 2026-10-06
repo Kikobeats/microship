@@ -2,7 +2,7 @@
   "name": "microship",
   "description": "Readiness, liveness, and graceful shutdown for a Node process on Kubernetes.",
   "homepage": "https://github.com/Kikobeats/microship",
-  "version": "1.0.0-0",
+  "version": "1.0.0",
   "main": "src/index.js",
   "author": {
     "email": "josefrancisco.verdu@gmail.com",
