@@ -98,51 +98,77 @@ Properly shutting down an application includes these steps:
 
 ### Timeouts
 
-The default `shutdownHandlerTimeout` is 5 seconds. Raise it when draining takes longer, and keep the pod's [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) (30 seconds by default) above `shutdownDelay + shutdownHandlerTimeout + 1s`. Otherwise the kubelet sends `SIGKILL` before the handlers finish.
+The default `shutdownHandlerTimeout` is 5 seconds. Raise it when draining takes longer, and keep the pod's [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) (30 seconds by default) above `shutdownDelay + shutdownHandlerTimeout + 1s`. Otherwise the kubelet sends `SIGKILL` before the handlers finish. The same sum has to fit in the liveness window. See [Kubernetes configuration](#kubernetes-configuration).
 
-## Kubernetes container probe configuration
+## Kubernetes configuration
 
-This is an example of a reasonable [container probe](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes) configuration to use with **microship**. The probe port must be different from your main service port.
+This is a reasonable `Deployment` to pair with the **microship** defaults. The [container probes](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes) point at the endpoints **microship** exposes.
 
 ```yaml
-readinessProbe:
-  httpGet:
-    path: /ready
-    port: 3001
-  failureThreshold: 1
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  successThreshold: 1
-  timeoutSeconds: 5
-livenessProbe:
-  httpGet:
-    path: /live
-    port: 3001
-  failureThreshold: 3
-  initialDelaySeconds: 10
-  # Allow sufficient amount of time (90 seconds = periodSeconds * failureThreshold)
-  # for the registered shutdown handlers to run to completion.
-  periodSeconds: 30
-  successThreshold: 1
-  # Setting a very low timeout value (e.g. 1 second) can cause false-positive
-  # checks and service interruption.
-  timeoutSeconds: 5
-
-# As per Kubernetes documentation (https://kubernetes.io/docs/concepts/workloads/pods/probes/#when-should-you-use-a-startup-probe),
-# startup probe should point to the same endpoint as the liveness probe.
-#
-# Startup probe is only needed when container is taking longer to start than
-# `initialDelaySeconds + failureThreshold × periodSeconds` of the liveness probe.
-startupProbe:
-  httpGet:
-    path: /live
-    port: 3001
-  failureThreshold: 3
-  initialDelaySeconds: 10
-  periodSeconds: 30
-  successThreshold: 1
-  timeoutSeconds: 5
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      # Must be above shutdownDelay + shutdownHandlerTimeout + 1s (11 seconds with the defaults).
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: app
+          image: app:1.0.0
+          ports:
+            - name: http
+              containerPort: 3000
+            # The `port` option. It must be different from your main service port.
+            - name: probes
+              containerPort: 3001
+          # Holds the other two probes until the process is up.
+          # Allows up to 30 seconds (periodSeconds * failureThreshold) to boot.
+          # As per Kubernetes documentation (https://kubernetes.io/docs/concepts/workloads/pods/probes/#when-should-you-use-a-startup-probe),
+          # startup probe should point to the same endpoint as the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /live
+              port: probes
+            periodSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: probes
+            # Must match the `shutdownDelay` option (5000 milliseconds).
+            periodSeconds: 5
+            failureThreshold: 1
+            successThreshold: 1
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: probes
+            # Allow sufficient amount of time (30 seconds = periodSeconds * failureThreshold)
+            # for the registered shutdown handlers to run to completion.
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
 ```
+
+Each value is tied to a **microship** option. When you change one side, change the other:
+
+| Kubernetes                                           | microship                                              | Rule                                                                                         |
+| ---------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `containerPort` of the probes                        | `port`                                                 | Equal. Do not use your main service port, and do not expose it through a `Service`.          |
+| `readinessProbe.periodSeconds`                       | `shutdownDelay`                                        | Equal, so the pod is observed as not ready before the shutdown handlers run.                 |
+| `terminationGracePeriodSeconds`                      | `shutdownDelay + shutdownHandlerTimeout + 1s`          | Greater. Otherwise the kubelet sends `SIGKILL` before the handlers finish.                   |
+| `livenessProbe.periodSeconds * failureThreshold`     | `shutdownDelay + shutdownHandlerTimeout + 1s`          | Greater, because `/live` returns `500` from the moment the shutdown starts.                  |
+| `livenessProbe.periodSeconds * failureThreshold`     | `staleMs`                                              | A stalled event loop is restarted within the sum of both: 45 seconds with these values.      |
 
 How quickly Kubernetes observes that the state has changed depends on the [probe configuration](https://kubernetes.io/docs/concepts/workloads/pods/probes/#configure-probes), specifically `periodSeconds`, `successThreshold` and `failureThreshold`. Expect requests to continue coming through for a while after calling `signalNotReady()`.
 
