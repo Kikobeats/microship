@@ -104,6 +104,9 @@ The default `shutdownHandlerTimeout` is 5 seconds. Raise it when draining takes 
 
 This is a reasonable `Deployment` to pair with the **microship** defaults. The [container probes](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes) point at the endpoints **microship** exposes.
 
+<details>
+<summary>deployment.yaml</summary>
+
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -158,6 +161,8 @@ spec:
             failureThreshold: 3
             timeoutSeconds: 5
 ```
+
+</details>
 
 Each value is tied to a **microship** option. When you change one side, change the other:
 
