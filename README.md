@@ -1,24 +1,217 @@
 # microship
 
-Readiness, liveness, and graceful shutdown for a Node process on Kubernetes.
+![Last version](https://img.shields.io/github/tag/Kikobeats/microship.svg?style=flat-square)
+[![Coverage Status](https://img.shields.io/coveralls/Kikobeats/microship.svg?style=flat-square)](https://coveralls.io/github/Kikobeats/microship)
+[![NPM Version](https://img.shields.io/npm/v/microship.svg?style=flat-square)](https://www.npmjs.org/package/microship)
 
-`/ready` and `/live` run on a [worker thread](https://nodejs.org/api/worker_threads.html). A busy event loop stays ready. `/live` returns 500 after the loop has not run for 15 seconds. Shutdown marks the process not ready, waits `shutdownDelay` so the kubelet observes it, runs the shutdown handler, then exits.
+> Readiness, liveness, and graceful shutdown for a Node.js process on Kubernetes.
+
+- Probes are served from a [worker thread](https://nodejs.org/api/worker_threads.html), so a busy event loop does not fail them.
+- Liveness fails only when the event loop has been stalled for 15 seconds.
+- Shutdown takes the pod out of rotation first, then drains, then exits.
+- Zero dependencies.
+
+## Install
+
+```bash
+npm install microship
+```
+
+## Usage
 
 ```js
 const { createMicroship } = require('microship')
+const http = require('http')
 
-const ship = await createMicroship({
-  port: 3001,
-  shutdownDelay: 1000,
-  shutdownHandlerTimeout: 90000,
-  terminate: () => process.exit(0)
-})
+const main = async () => {
+  const server = http.createServer((req, res) => res.end('hello'))
+  const ship = await createMicroship()
 
-ship.registerShutdownHandler(async () => {
-  // drain in-flight work
-})
+  ship.registerShutdownHandler(
+    () => new Promise(resolve => server.close(resolve))
+  )
 
-ship.signalReady()
+  server.listen(3000, () => ship.signalReady())
+}
+
+main()
 ```
 
-`shutdownHandlerTimeout` forces `terminate` when the handler does not finish. Signals are `SIGTERM` and `SIGINT`.
+The probe server is listening as soon as `createMicroship` resolves. The process reports not ready until you call `signalReady()`.
+
+## Probes
+
+It creates an HTTP service used to check [container probes](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes). Refer to the Kubernetes documentation for information about the readiness and liveness checks:
+
+- [Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+
+Both endpoints answer with a status code and an empty body. Any other path returns `404`.
+
+| Endpoint | `200`                                             | `500`                                                              |
+| -------- | ------------------------------------------------- | ------------------------------------------------------------------ |
+| `/ready` | After `signalReady()`.                            | Before `signalReady()`, after `signalNotReady()`, during shutdown. |
+| `/live`  | The event loop ran within the last `staleMs` (15s). | The event loop has been stalled for `staleMs`, or during shutdown. |
+
+`/ready` is used to configure the readiness probe: it tells Kubernetes whether to send traffic to the pod. `/live` is used to configure the liveness probe: it tells Kubernetes whether to restart the container.
+
+The endpoints are separate so a container can take itself out of rotation with `signalNotReady()` without being restarted.
+
+### Why a worker thread
+
+A probe served from the main thread shares the event loop with your workload. When the process performs [event loop blocking tasks](https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop) the probes fail intermittently:
+
+```
+Warning  Unhealthy  4m17s (x3 over 4m27s)   kubelet  Liveness probe failed: Get http://10.24.7.155:3001/live: net/http: request canceled (Client.Timeout exceeded while awaiting headers)
+Warning  Unhealthy  3m28s (x15 over 4m38s)  kubelet  Readiness probe failed: Get http://10.24.7.155:3001/ready: net/http: request canceled (Client.Timeout exceeded while awaiting headers)
+```
+
+Kubernetes marks a healthy pod as unready, and the remaining pods take more load.
+
+**microship** serves the probes from a worker thread. The main thread writes its state and a heartbeat every 500ms into a `SharedArrayBuffer`, and the worker reads it. A busy main thread keeps answering `/ready` with `200`. `/live` fails only when the heartbeat has not moved for `staleMs`, which is a stalled process and not a busy one.
+
+## Graceful shutdown
+
+On `SIGTERM`, `SIGHUP`, or `SIGINT`, or when you call `ship.shutdown()`:
+
+1. `/ready` and `/live` start returning `500`.
+2. It waits `shutdownDelay`, so Kubernetes stops routing new requests to the pod.
+3. It runs the shutdown handlers one at a time, in registration order.
+4. The process exits on its own once nothing keeps the event loop active. If it has not exited one second after the last handler finishes, `terminate` is called.
+
+If the handlers take longer than `shutdownHandlerTimeout`, `terminate` is called right away. If a handler throws, the remaining handlers are skipped and `terminate` is still called.
+
+Do not call `process.exit()` in a shutdown handler. **microship** ends the process after all registered shutdown handlers have run to completion.
+
+### Add a delay before you stop handling incoming requests
+
+It is important that you do not cease to handle new incoming requests immediately after receiving the shutdown signal. There is a high probability of the `SIGTERM` signal being sent well before the iptables rules are updated on all nodes. The result is that the pod may still receive client requests after it has received the termination signal. If the app stops accepting connections immediately, clients receive "connection refused" errors.
+
+Properly shutting down an application includes these steps:
+
+1. Wait for a few seconds, then stop accepting new connections.
+2. Close all keep-alive connections that are not in the middle of a request.
+3. Wait for all active requests to finish.
+4. Shut down completely.
+
+`shutdownDelay` is step 1. Its value should match `readinessProbe.periodSeconds`. See [Handling Client Requests Properly with Kubernetes](https://web.archive.org/web/20200807161820/https://freecontent.manning.com/handling-client-requests-properly-with-kubernetes/) for more information.
+
+### Timeouts
+
+The default `shutdownHandlerTimeout` is 5 seconds. Raise it when draining takes longer, and keep the pod's [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) (30 seconds by default) above `shutdownDelay + shutdownHandlerTimeout + 1s`. Otherwise the kubelet sends `SIGKILL` before the handlers finish.
+
+## Kubernetes container probe configuration
+
+This is an example of a reasonable [container probe](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes) configuration to use with **microship**. The probe port must be different from your main service port.
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 3001
+  failureThreshold: 1
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  successThreshold: 1
+  timeoutSeconds: 5
+livenessProbe:
+  httpGet:
+    path: /live
+    port: 3001
+  failureThreshold: 3
+  initialDelaySeconds: 10
+  # Allow sufficient amount of time (90 seconds = periodSeconds * failureThreshold)
+  # for the registered shutdown handlers to run to completion.
+  periodSeconds: 30
+  successThreshold: 1
+  # Setting a very low timeout value (e.g. 1 second) can cause false-positive
+  # checks and service interruption.
+  timeoutSeconds: 5
+
+# As per Kubernetes documentation (https://kubernetes.io/docs/concepts/workloads/pods/probes/#when-should-you-use-a-startup-probe),
+# startup probe should point to the same endpoint as the liveness probe.
+#
+# Startup probe is only needed when container is taking longer to start than
+# `initialDelaySeconds + failureThreshold × periodSeconds` of the liveness probe.
+startupProbe:
+  httpGet:
+    path: /live
+    port: 3001
+  failureThreshold: 3
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  successThreshold: 1
+  timeoutSeconds: 5
+```
+
+How quickly Kubernetes observes that the state has changed depends on the [probe configuration](https://kubernetes.io/docs/concepts/workloads/pods/probes/#configure-probes), specifically `periodSeconds`, `successThreshold` and `failureThreshold`. Expect requests to continue coming through for a while after calling `signalNotReady()`.
+
+## Local mode
+
+Kubernetes is detected through the `KUBERNETES_SERVICE_HOST` environment variable. If **microship** detects that it is running in a non-Kubernetes environment (e.g. your local machine):
+
+- It starts the HTTP service on any available port. This avoids port collisions when multiple services using **microship** are being developed on the same machine. The bound port is available as `ship.port`.
+- `shutdownDelay` defaults to `0`, i.e. it immediately proceeds to execute the shutdown handlers.
+
+Detection of the local mode can be overridden by setting `{ detectKubernetes: false }`.
+
+## API
+
+### createMicroship([options])
+
+Returns a `Promise` that resolves to a `ship` once the probe server is listening. It rejects when the port cannot be bound.
+
+#### options
+
+| Name                     | Type         | Default                           | Description                                                                 |
+| ------------------------ | ------------ | --------------------------------- | --------------------------------------------------------------------------- |
+| `port`                   | `number`     | `3001`                            | Probe server port. It must be different from your main service port. Outside Kubernetes a random free port is used instead. |
+| `shutdownDelay`          | `number`     | `5000`, or `0` outside Kubernetes | Milliseconds between failing the probes and running the shutdown handlers. It should match `readinessProbe.periodSeconds`. |
+| `shutdownHandlerTimeout` | `number`     | `5000`                            | Milliseconds the shutdown handlers get before `terminate` is forced.        |
+| `staleMs`                | `number`     | `15000`                           | Milliseconds without a heartbeat before `/live` fails.                      |
+| `signals`                | `string[]`   | `['SIGTERM', 'SIGHUP', 'SIGINT']` | Signals that start the shutdown.                                            |
+| `terminate`              | `function`   | `() => process.exit(0)`           | Called to end the process.                                                  |
+| `detectKubernetes`       | `boolean`    | `true`                            | When `false`, `port` and `shutdownDelay` behave as they do inside Kubernetes. |
+
+### ship
+
+#### .signalReady()
+
+Makes `/ready` return `200`. It does nothing once the shutdown has started.
+
+#### .signalNotReady()
+
+Makes `/ready` return `500` without shutting down. Use it to take the pod out of rotation while a dependency is unavailable.
+
+#### .registerShutdownHandler(fn)
+
+Adds a function to run during shutdown. It can return a `Promise`.
+
+#### .shutdown()
+
+Starts the shutdown sequence without waiting for a signal. Returns a `Promise` that resolves when the handlers have run. Calling it again does nothing.
+
+#### .isServerReady()
+
+Returns `true` after `signalReady()` and before the shutdown starts.
+
+#### .isServerShuttingDown()
+
+Returns `true` once the shutdown has started.
+
+#### .port
+
+The port the probe server is bound to.
+
+#### .stop()
+
+Stops the heartbeat, removes the signal listeners, and terminates the worker. Returns a `Promise`. Meant for tests.
+
+## License
+
+The API and the Kubernetes guidance come from [lightship](https://github.com/gajus/lightship) by Gajus Kuizinas.
+
+**microship** © [Kiko Beats](https://kikobeats.com), released under the MIT License.<br>
+Authored and maintained by [Kiko Beats](https://kikobeats.com) with help from [contributors](https://github.com/Kikobeats/microship/contributors).
+
+> [kikobeats.com](https://kikobeats.com) · GitHub [Kiko Beats](https://github.com/Kikobeats) · X [@Kikobeats](https://x.com/Kikobeats)
