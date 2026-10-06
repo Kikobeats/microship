@@ -43,7 +43,7 @@
     "src"
   ],
   "scripts": {
-    "contributors": "(git-authors-cli && finepack && git add package.json && git commit -m 'build: contributors' --no-verify) || true",
+    "contributors": "git-authors-cli && finepack && git add package.json && (git diff --cached --quiet || git commit -m 'build: contributors' --no-verify)",
     "lint": "standard",
     "postrelease": "pnpm release:tags && pnpm release:github && (ci-publish || pnpm publish --access=public)",
     "release": "pnpm release:version && pnpm release:changelog && pnpm release:commit && pnpm release:tag",
