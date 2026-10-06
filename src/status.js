@@ -13,10 +13,10 @@ const beatAge = (view, state, now) => {
   return now - state.lastBeatAt
 }
 
-const statusFor = (view, state, url, now, staleMs = STALE_MS) => {
+const statusFor = (view, state, url, now) => {
   const shuttingDown = Atomics.load(view, 1) === 1
   const ready = Atomics.load(view, 0) === 1 && !shuttingDown
-  const live = !shuttingDown && beatAge(view, state, now) < staleMs
+  const live = !shuttingDown && beatAge(view, state, now) < STALE_MS
   if (url === '/live') return live ? 200 : 500
   if (url === '/ready') return ready ? 200 : 500
   return 404

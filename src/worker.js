@@ -10,7 +10,7 @@ const state = createState()
 
 const server = http.createServer((req, res) => {
   const url = (req.url || '/').split('?')[0]
-  const code = statusFor(view, state, url, Date.now(), workerData.staleMs)
+  const code = statusFor(view, state, url, Date.now())
   res.writeHead(code, { 'content-type': 'text/plain' })
   res.end()
 })
